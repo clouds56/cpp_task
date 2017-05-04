@@ -45,7 +45,7 @@ struct utility {
     }
 };
 
-template <typename T> struct job;
+template <typename T> struct Job;
 
 struct job_base {
     typedef int priority_type;
@@ -63,7 +63,7 @@ struct job_base {
     const priority_type priority;
 
     template <typename Fn, class... Args, typename R = typename std::result_of<Fn(Args...)>::type>
-    static job<R> make(priority_type priority, Fn &&fn, Args... args) { // -> job_base<decltype(fn(args...))>
+    static Job<R> make(priority_type priority, Fn &&fn, Args... args) { // -> job_base<decltype(fn(args...))>
         std::cerr << "pushing task" << std::endl;
         std::packaged_task<R(Args...)> raw_task(std::forward<Fn>(fn));
         auto fut = raw_task.get_future();
@@ -74,16 +74,16 @@ struct job_base {
 };
 
 template <typename T>
-struct job : job_base {
+struct Job : job_base {
     typedef T ResultType;
 
-    job(priority_type priority, utility::Task_ptr &&task, std::future<ResultType> &&fut) : job_base(priority, std::move(task)), fut(std::move(fut)) { }
-    job(job &&o) : job_base(std::move(o)), fut(std::move(o.fut)) { }
-    job(const job &) = delete;
+    Job(priority_type priority, utility::Task_ptr &&task, std::future<ResultType> &&fut) : job_base(priority, std::move(task)), fut(std::move(fut)) { }
+    Job(Job &&o) : job_base(std::move(o)), fut(std::move(o.fut)) { }
+    Job(const Job &) = delete;
     std::future<ResultType> fut;
 
     template <typename Fn, typename U>
-    static job make(priority_type priority, Fn &&fn, std::future<U> &&arg_fut) { // -> job_base<decltype(fn(args...))>
+    static Job make(priority_type priority, Fn &&fn, std::future<U> &&arg_fut) { // -> job_base<decltype(fn(args...))>
         std::cerr << "pushing task (then)" << std::endl;
         std::packaged_task<T(U)> raw_task(std::forward<Fn>(fn));
         auto fut = raw_task.get_future();
@@ -93,12 +93,12 @@ struct job : job_base {
     }
 
     template <typename Fn, typename R = typename std_exp::invoke_result<Fn, T>::type>
-    job<R> then(Fn &&f) {
+    Job<R> then(Fn &&f) {
         return then(std::forward<Fn>(f), priority);
     }
     template <typename Fn, typename R = typename std_exp::invoke_result<Fn, T>::type>
-    job<R> then(Fn &&f, priority_type priority) {
-        auto job = job<R>::make(priority, f, std::move(fut));
+    Job<R> then(Fn &&f, priority_type priority) {
+        auto job = Job<R>::make(priority, f, std::move(fut));
         job.last = this;
         return job;
     }
@@ -171,19 +171,6 @@ private:
 public:
     static task_queue main;
 
-    void push(job_base *job) {
-        if (job->last) {
-            push(job->last);
-        }
-        push_(std::move(job->task));
-    }
-
-    template <typename R>
-    std::future<R> push(job<R> &&job) {
-        push_(std::move(job.task));
-        return std::move(job.fut);
-    }
-
     template <typename Fn, class... Args>
     std::future<typename std::result_of<Fn(Args...)>::type> push(Fn &&fn, Args&&... args) { // -> std::future<decltype(fn(args...))>
         auto job = job_base::make(job_base::priority_realtime, std::forward<Fn>(fn), std::forward<Args>(args)...);
@@ -203,7 +190,7 @@ public:
     }
 
     template <typename R>
-    std::future<R> push(job<R> &&job, bool recursive) {
+    std::future<R> push(Job<R> &&job, bool recursive) {
         if (recursive && job.last) {
             push(job.last);
         }
