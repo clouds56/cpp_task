@@ -45,20 +45,33 @@ struct utility {
     }
 };
 
+struct result_base_shared;
+struct result_base {
+    virtual void get_void() = 0;
+    virtual result_base_shared* share() = 0;
+};
+
+struct result_base_shared : result_base {
+    result_base_shared* share() {
+        return this;
+    }
+};
+
 template <typename T> struct Job;
 
-struct job_base {
+struct job_base : std::enable_shared_from_this<job_base> {
     typedef int priority_type;
 
     static const priority_type priority_realtime = 0;
 
-    job_base(priority_type priority, utility::Task_ptr &&task) : task(std::move(task)), last(nullptr), priority(priority) { }
+    job_base(priority_type priority, utility::Task_ptr &&task) : task(std::move(task)), next(nullptr), last(nullptr), priority(priority) { }
     job_base(job_base &&o) : job_base(o.priority, std::move(o.task)) {
         std::cerr << "moving job_base" << std::endl;
     }
     job_base(const job_base &) = delete;
 
     utility::Task_ptr task;
+    std::shared_ptr<job_base> next;
     job_base *last;
     const priority_type priority;
 
@@ -71,6 +84,11 @@ struct job_base {
         auto task = utility::make_function_task(std::move(raw_task), std::forward<Args>(args)...);
         return { priority, std::move(task), std::move(fut) };
     }
+
+    template <typename Fn, class... Args, typename R = typename std::result_of<Fn(Args...)>::type>
+    static std::shared_ptr<Job<R>> make_shared(priority_type priority, Fn &&fn, Args... args) {
+        return std::make_shared<Job<R>>(make(priority, std::forward<Fn>(fn), std::forward<Args>(args)...));
+    };
 };
 
 template <typename T>
@@ -93,21 +111,30 @@ struct Job : job_base {
     }
 
     template <typename Fn, typename R = typename std_exp::invoke_result<Fn, T>::type>
-    Job<R> then(Fn &&f) {
-        return then(std::forward<Fn>(f), priority);
+    std::shared_ptr<Job<R>> then(Fn &&f) {
+        return then(priority, std::forward<Fn>(f));
     }
     template <typename Fn, typename R = typename std_exp::invoke_result<Fn, T>::type>
-    Job<R> then(Fn &&f, priority_type priority) {
-        auto job = Job<R>::make(priority, f, std::move(fut));
-        job.last = this;
+    std::shared_ptr<Job<R>> then(priority_type priority, Fn &&f) {
+        auto job = std::make_shared<Job<R>>(std::move(Job<R>::make(priority, f, std::move(fut))));
+        next = job;
+        job->last = this;
         return job;
+    }
+
+    std::pair<std::shared_ptr<job_base>, std::future<ResultType>> commit() {
+        job_base *root = this;
+        while (root->last) {
+            root = root->last;
+        }
+        return { root->shared_from_this(), std::move(fut) };
     }
 };
 
 class scheduler {
 public:
     scheduler() = default;
-    virtual utility::Task_ptr pop();
+    virtual utility::Task_ptr pop() = 0;
     virtual ~scheduler() { };
 };
 
@@ -116,10 +143,9 @@ class task_queue {
     std::atomic_bool stopping;
     std::mutex q_mutex;
     std::queue<utility::Task_ptr> q;
-    scheduler *s;
+    std::shared_ptr<scheduler> s;
 
-public:
-    task_queue() : stopping(false) {
+    task_queue(std::shared_ptr<scheduler> s = {}) : stopping(false), s(s) {
         std::cerr << "tasks running..." << std::endl;
         th = std::thread([this]() { this->loop(); });
     }
@@ -133,7 +159,6 @@ public:
         std::cerr << "tasks exit" << std::endl;
     }
 
-private:
     void loop() {
         while (!stopping) {
             auto task = pop();
@@ -154,7 +179,8 @@ private:
         auto task = pop_();
         if (task)
             return task;
-//        return s->pop();
+        if (s)
+            return s->pop();
         return {};
     }
 
@@ -171,6 +197,8 @@ private:
 public:
     static task_queue main;
 
+    std::shared_ptr<scheduler> get_scheduler() { return s; }
+
     template <typename Fn, class... Args>
     std::future<typename std::result_of<Fn(Args...)>::type> push(Fn &&fn, Args&&... args) { // -> std::future<decltype(fn(args...))>
         auto job = job_base::make(job_base::priority_realtime, std::forward<Fn>(fn), std::forward<Args>(args)...);
@@ -183,6 +211,7 @@ public:
     }
 
     void push(job_base *job) {
+        if (!job) return;
         if (job->last) {
             push(job->last);
         }
@@ -190,16 +219,17 @@ public:
     }
 
     template <typename R>
-    std::future<R> push(Job<R> &&job, bool recursive) {
-        if (recursive && job.last) {
-            push(job.last);
+    std::future<R> push(std::shared_ptr<Job<R>> job, bool recursive) {
+        if (!job) return {};
+        if (recursive && job->last) {
+            push(job->last);
         }
-        push_(std::move(job.task));
-        return std::move(job.fut);
+        push_(std::move(job->task));
+        return std::move(job->fut);
     }
 };
 
-class priority_scheduler {
+class priority_scheduler : public scheduler {
     template <typename Key, typename Value>
     struct PriorityList {
         typedef int priority_type;
@@ -208,6 +238,8 @@ class priority_scheduler {
         typedef std::pair<priority_type, list_iter> Iter;
         std::map<priority_type, list_type> q;
         std::map<Key, Iter> idx;
+
+        PriorityList() : size(0) { }
 
         void push(priority_type priority, const Key& key, Value value) {
             erase_(key);
@@ -220,12 +252,12 @@ class priority_scheduler {
             return erase_(key);
         }
 
-        Value pop() {
+        std::pair<const Key, Value> pop() {
             if (!empty_()) {
                 auto it = get_first();
-                auto value = std::move(it.second->second);
+                auto value = std::move(*it.second);
                 erase_(it.second->first);
-                return std::move(value);
+                return value;
             }
             throw;
         }
@@ -249,10 +281,9 @@ class priority_scheduler {
         }
 
         Iter get_first() {
-            for (auto qit = q.begin(); qit != q.end(); ++qit) {
-                if (!qit->second.empty()) {
-                    list_type &l = q[qit->first];
-                    return { qit->first, l.begin() };
+            for (auto& qit : q) {
+                if (!qit.second.empty()) {
+                    return { qit.first, qit.second.begin() };
                 }
             }
             return {};
@@ -263,19 +294,33 @@ class priority_scheduler {
         }
     };
 
-    PriorityList<std::string, job_base> pl;
+    PriorityList<std::string, std::shared_ptr<job_base>> pl;
     std::mutex pl_mutex;
 
-//    utility::Task_ptr pop() {
-//        std::lock_guard<std::mutex> lg(pl_mutex);
-//        if (pl.empty()) {
-//            return {};
-//        }
-//        auto job = pl.pop();
-//        pl.push(job.priority, "", std::move(*job.last));
-//        return std::move(job.task);
-//    }
+public:
+    utility::Task_ptr pop() {
+        std::lock_guard<std::mutex> lg(pl_mutex);
+        if (pl.empty()) {
+            return {};
+        }
+        auto item = pl.pop();
+        if (item.second->next) {
+            pl.push(item.second->priority, item.first, item.second->next);
+        }
+        return std::move(item.second->task);
+    }
+
+    void push(const std::string &key, std::shared_ptr<job_base> job) {
+        std::lock_guard<std::mutex> lg(pl_mutex);
+        pl.push(job->priority, key, job);
+    }
+
+    void erase(const std::string &key) {
+        std::lock_guard<std::mutex> lg(pl_mutex);
+        pl.erase(key);
+    }
 };
 
 }
+
 #endif //CPP_TASK_LIBRARY_H
