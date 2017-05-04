@@ -27,19 +27,21 @@ struct utility {
         function_task_base& operator=(const function_task_base&) = delete;
     };
 
-    template <typename F>
+    template <typename F, typename... Args>
     struct function_task : function_task_base {
+        using ArgTp = std::tuple<typename std::decay<Args>::type...>;
         F functor;
-        function_task(F &&functor) noexcept : functor(std::move(functor)) { }
-        function_task(function_task<F> &&f) = default;
-        void operator()() { functor(); }
+        ArgTp args;
+        function_task(F &&functor, Args&&... args) noexcept : functor(std::move(functor)), args(std::make_tuple(std_exp::decay_copy(std::forward<Args>(args))...)) { }
+        function_task(function_task<F, Args...> &&f) = default;
+        void operator()() { std_exp::apply(functor, std::move(args)); }
     };
 
     typedef std::unique_ptr<function_task_base> Task_ptr;
 
-    template <typename Functor>
-    static Task_ptr make_function_task(Functor &&functor) {
-        return Task_ptr(new function_task<Functor>(std::move(functor)));
+    template <typename Functor, typename... Args>
+    static Task_ptr make_function_task(Functor &&functor, Args&&... args) {
+        return Task_ptr(new function_task<Functor, Args...>(std::forward<Functor>(functor), std::forward<Args>(args)...));
     }
 };
 
@@ -63,10 +65,10 @@ struct job_base {
     template <typename Fn, class... Args, typename R = typename std::result_of<Fn(Args...)>::type>
     static job<R> make(priority_type priority, Fn &&fn, Args... args) { // -> job_base<decltype(fn(args...))>
         std::cerr << "pushing task" << std::endl;
-        std::packaged_task<typename std::remove_pointer<typename std::remove_reference<Fn>::type>::type> raw_task(std::forward<Fn>(fn));
+        std::packaged_task<R(Args...)> raw_task(std::forward<Fn>(fn));
         auto fut = raw_task.get_future();
         static_assert(std::is_same<std::future<typename std::result_of<Fn(Args...)>::type>, decltype(fut)>::value, "");
-        auto task = utility::make_function_task([args...,raw_task=std::move(raw_task)]() mutable { std::cerr<<"raw_task<void>"<<std::endl;raw_task(args...); });
+        auto task = utility::make_function_task(std::move(raw_task), std::forward<Args>(args)...);
         return { priority, std::move(task), std::move(fut) };
     }
 };
@@ -116,18 +118,22 @@ class task_queue {
     std::queue<utility::Task_ptr> q;
     scheduler *s;
 
+public:
     task_queue() : stopping(false) {
         std::cerr << "tasks running..." << std::endl;
         th = std::thread([this]() { this->loop(); });
     }
 
     ~task_queue() {
+        std::cerr << "tasks shutting down..." << std::endl;
         stopping = true;
         if (th.joinable()) {
             th.join();
         }
+        std::cerr << "tasks exit" << std::endl;
     }
 
+private:
     void loop() {
         while (!stopping) {
             auto task = pop();
@@ -179,8 +185,8 @@ public:
     }
 
     template <typename Fn, class... Args>
-    std::future<decltype(std::declval<Fn>()(std::declval<Args>()...))> push(Fn &&fn, Args... args) { // -> std::future<decltype(fn(args...))>
-        auto job = job<void>::make(job_base::priority_realtime, std::forward<Fn>(fn), args...);
+    std::future<typename std::result_of<Fn(Args...)>::type> push(Fn &&fn, Args&&... args) { // -> std::future<decltype(fn(args...))>
+        auto job = job_base::make(job_base::priority_realtime, std::forward<Fn>(fn), std::forward<Args>(args)...);
         if (std::this_thread::get_id() == th.get_id()) {
             (*job.task)();
         } else {
@@ -189,20 +195,20 @@ public:
         return std::move(job.fut);
     }
 
-    static std::future<double> test1(int index, std::unique_ptr<double> a, double b) {
-        auto f = [index](std::unique_ptr<double> a, double b) {
-            std::cerr << index << std::endl;
-            *a *= b;
-            return std::move(a);
-        };
-        return main.push(job_base::make(job_base::priority_realtime ,f, std::move(a), b).then([](std::unique_ptr<double> p) {return *p;}));
+    void push(job_base *job) {
+        if (job->last) {
+            push(job->last);
+        }
+        push_(std::move(job->task));
     }
 
-    static std::future<std::pair<double, double>> test2(double a, double b) {
-        auto *f = +[](double a, double b) {
-            return std::make_pair(a + b, a - b);
-        };
-        return main.push(f, a, b);
+    template <typename R>
+    std::future<R> push(job<R> &&job, bool recursive) {
+        if (recursive && job.last) {
+            push(job.last);
+        }
+        push_(std::move(job.task));
+        return std::move(job.fut);
     }
 };
 
@@ -218,7 +224,7 @@ class priority_scheduler {
 
         void push(priority_type priority, const Key& key, Value value) {
             erase_(key);
-            q[priority].push_back({key, value});
+            q[priority].push_back({key, std::move(value)});
             size++;
             idx[key] = std::make_pair(priority, std::prev(q[priority].end()));
         }
@@ -227,14 +233,14 @@ class priority_scheduler {
             return erase_(key);
         }
 
-        std_exp::optional<Value> pop() {
+        Value pop() {
             if (!empty_()) {
                 auto it = get_first();
-                auto value = it.second->second;
+                auto value = std::move(it.second->second);
                 erase_(it.second->first);
-                return value;
+                return std::move(value);
             }
-            return {};
+            throw;
         }
 
         bool empty() const {
@@ -255,10 +261,11 @@ class priority_scheduler {
             return false;
         }
 
-        Iter get_first() const {
-            for (auto qit : q) {
+        Iter get_first() {
+            for (auto qit = q.begin(); qit != q.end(); ++qit) {
                 if (!qit->second.empty()) {
-                    return { qit->first, qit->second.begin() };
+                    list_type &l = q[qit->first];
+                    return { qit->first, l.begin() };
                 }
             }
             return {};
@@ -274,13 +281,12 @@ class priority_scheduler {
 
 //    utility::Task_ptr pop() {
 //        std::lock_guard<std::mutex> lg(pl_mutex);
-//        auto job_ = pl.pop();
-//        if (job_.hasValue()) {
-//            const auto& job = *job_;
-//            pl.push(job.priority, "", *job.last);
-//            return std::move(job.task);
+//        if (pl.empty()) {
+//            return {};
 //        }
-//        return {};
+//        auto job = pl.pop();
+//        pl.push(job.priority, "", std::move(*job.last));
+//        return std::move(job.task);
 //    }
 };
 

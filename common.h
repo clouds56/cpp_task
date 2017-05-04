@@ -6,6 +6,7 @@
 #define CPP_TASK_COMMON_H
 
 #include <type_traits>
+#include <functional>
 
 namespace std_exp {
 
@@ -44,6 +45,22 @@ struct invoke_result {
 //    typedef decltype(__invoke(std::declval<F>(), std::declval<Args>()...)) type;
     typedef decltype(std::declval<F>()(std::declval<Args>()...)) type;
 };
+
+template <class T>
+std::decay_t<T> decay_copy(T&& v) { return std::forward<T>(v); }
+
+template <class F, class Tuple, std::size_t... I>
+constexpr decltype(auto) __apply_impl(F &&f, Tuple &&t, std::index_sequence<I...>)
+{
+    return std_exp::__invoke(std::forward<F>(f), std::get<I>(std::forward<Tuple>(t))...);
+}
+template <class F, class Tuple>
+constexpr decltype(auto) apply(F &&f, Tuple &&t)
+{
+    return __apply_impl(
+            std::forward<F>(f), std::forward<Tuple>(t),
+            std::make_index_sequence<std::tuple_size<std::decay_t<Tuple>>::value>{});
+}
 
 }
 
